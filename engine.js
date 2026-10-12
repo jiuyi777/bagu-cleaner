@@ -110,7 +110,7 @@ export const DEFAULT_RULES = [
     FL('f_cold', 'flagImagery', '如坠冰窟|淬(?:了|着)?(?:冰|毒)', '淬了冰'),
 ];
 
-export const DEFAULT_AI_PROMPT = `你是中文小说编辑，负责给 AI 角色扮演用的角色卡、世界书、开场白去“八股”。
+export const LEGACY_AI_PROMPT = `你是中文小说编辑，负责给 AI 角色扮演用的角色卡、世界书、开场白去“八股”。
 
 八股指 AI 写作的套路化表达，例如：程度副词堆叠（极其/极为/极度）、量词修饰（一丝/一抹/一缕）、若有若无的弧度、骨节分明的手指、眼神暗了暗、空气凝固、时间停滞、命运的齿轮、猎人与猎物、石子投湖、手术刀般精准、“不是……而是……”“与其说……不如说……”这类伪深刻转折、伪精确数字（0.3秒、15度）、硬塞的解剖学词汇、全知视角插入、不必要的动物比喻、空洞的升华式结尾。
 
@@ -122,6 +122,29 @@ export const DEFAULT_AI_PROMPT = `你是中文小说编辑，负责给 AI 角色
 5. 篇幅与原文接近或更短。
 6. 【必须改掉】里列出的词句，结果里一个都不能再出现（包括对白里），换成具体描写或直接删去。
 7. 只输出改写后的正文，不要解释，不要加标题，不要用代码块或引号包住全文。`;
+
+// 所有 API 模式均执行此编辑约束，包括用户保存过的自定义提示词。
+export const EDIT_CONTRACT = `【局部编辑约束】
+逐段保留原文的人物、动作、对白、场景细节、情绪变化、事件顺序和设定信息，只调整命中的词句及其必要衔接。
+可直接删除不承载信息的赘词、重复修饰；承载信息的词句改成自然表达，保留原意和语气。未命中的内容尽量原样保留。
+必改词是措辞修改目标。遇到宽泛规则或改写后仍命中时，优先保全内容，留下待人工处理的词句。
+逐段输出完整修改稿，正文长度通常保持原文的 90%～110%，至少保留 80%；靠保留细节达到篇幅，保持原有剧情。
+原样保留宏、标签、代码块、链接及 Markdown 结构。只输出修改后的全文。`;
+
+export const DEFAULT_AI_PROMPT = `你是中文小说编辑，负责调整角色卡、世界书和开场白中的套路化表达。
+
+${EDIT_CONTRACT}`;
+
+export function rewriteIssue(before, after) {
+    const count = (s) => String(s ?? '').replace(/<[^>]*>/g, '').replace(/\s/g, '').length;
+    const oldSize = count(before);
+    const newSize = count(after);
+    if (oldSize && newSize < Math.ceil(oldSize * 0.8)) {
+        return `正文从 ${oldSize} 字缩为 ${newSize} 字，低于原文的 80%`;
+    }
+    if (!String(after ?? '').trim() && String(before ?? '').trim()) return '结果为空';
+    return '';
+}
 
 // ───────────── 规则编译 ─────────────
 

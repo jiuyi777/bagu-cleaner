@@ -2,10 +2,11 @@
 import {
     RULE_GROUPS, DEFAULT_RULES, DEFAULT_AI_PROMPT, buildRules, cleanText, scanText,
     looksLikeInstructions, diffText, protectStats, splitChunks, mustHits, hitList,
+    LEGACY_AI_PROMPT, EDIT_CONTRACT, rewriteIssue,
 } from './engine.js';
 
 const MODULE = 'baguCleaner';
-const SETTINGS_VERSION = 2;
+const SETTINGS_VERSION = 3;
 const getCtx = () => SillyTavern.getContext();
 
 const CHAR_FIELDS = [
@@ -59,7 +60,7 @@ function settings() {
     if ((s.version ?? 1) < SETTINGS_VERSION) {
         s.mode = 'api';
         s.includeDisabledEntries = true;
-        if (!String(s.aiPrompt).includes('必须改掉')) s.aiPrompt = DEFAULT_AI_PROMPT;
+        if (s.aiPrompt === LEGACY_AI_PROMPT) s.aiPrompt = DEFAULT_AI_PROMPT;
         s.version = SETTINGS_VERSION;
     }
     for (const f of CHAR_FIELDS) s.fields[f.key] ??= true;
@@ -317,34 +318,52 @@ ${lines.join('\n') || '（无）'}
 ${body}`;
 }
 
-/** 改写一段；必改项没改干净就带着问题再要一次 */
+/** 每次都以完整原文为基准；缩短过多的候选不进入结果。 */
 async function rewriteChunk(kind, body, opts) {
-    const sys = settings().aiPrompt;
+    const sys = `${settings().aiPrompt}\n\n${EDIT_CONTRACT}`;
     const user = buildUserMsg(kind, body, opts);
-    let res = tidyLLM(await callLLM(sys, user, body.length));
-    if (!res) throw new Error('模型返回为空');
-    const left = [...new Set(mustHits(res, opts).map((h) => h.match))];
-    if (left.length && !state.abort) {
-        const retry = `${user}
+    let best = null;
+    let bestHits = mustHits(body, opts).length;
+    let accepted = false;
+    let problem = '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+        if (state.abort) throw new Error('已停止，本项原文保留');
+        const prompt = attempt === 0 ? user : `${user}
 
-【你上一次的结果】
-${res}
-
-【问题】结果里仍然出现了：${left.map((m) => `「${m}」`).join('、')}。在上一次结果的基础上把这些改掉，其余保持不变，只输出全文。`;
-        const res2 = tidyLLM(await callLLM(sys, retry, body.length));
-        if (res2) res = res2;
+【上次处理问题】${problem}
+请依据上面原段的动作、对白、细节和事件顺序，重新写出完整的一段。保留原意和叙述语气，换掉命中的表达，正文达到原段的 90%～110%，只输出重写后的段落。`;
+        const res = tidyLLM(await callLLM(sys, prompt, body.length));
+        if (state.abort) throw new Error('已停止，本项原文保留');
+        const issue = rewriteIssue(body, res);
+        if (issue) {
+            problem = `${issue}。需要恢复原文的动作、对白和细节，只删赘词，其余改写`;
+            continue;
+        }
+        const hits = mustHits(res, opts);
+        if (!accepted || hits.length <= bestHits) {
+            best = res;
+            bestHits = hits.length;
+            accepted = true;
+        }
+        if (!hits.length) return { text: res, warning: '' };
+        problem = `以下措辞仍需局部改写：${[...new Set(hits.map(h => h.match))].map(m => `「${m}」`).join('、')}。保留它们所表达的信息`;
     }
-    return res;
+    if (!accepted) throw new Error('该段连续 3 次输出过短，本项生成已停止，可点重新生成再处理。');
+    return { text: best, warning: '部分词句仍待检查，已保留内容完整的修改稿。' };
 }
 
 async function apiRewrite(text, it, opts, onlyHit) {
     const out = [];
-    for (const chunk of splitChunks(text, 1800)) {
+    it.rewriteWarnings = [];
+    for (const chunk of splitChunks(text, 1)) {
         const lead = chunk.match(/^\s*/)[0];
         const trail = chunk.slice(lead.length).match(/\s*$/)[0];
         const body = chunk.slice(lead.length, chunk.length - trail.length);
-        if (state.abort || !body || (onlyHit && scanText(body, opts).total === 0)) { out.push(chunk); continue; }
-        out.push(lead + await rewriteChunk(it.kind, body, opts) + trail);
+        if (state.abort) throw new Error('已停止，本项原文保留');
+        if (!body || (onlyHit && scanText(body, opts).total === 0)) { out.push(chunk); continue; }
+        const result = await rewriteChunk(it.kind, body, opts);
+        out.push(lead + result.text + trail);
+        if (result.warning) it.rewriteWarnings.push(result.warning);
     }
     return out.join('');
 }
@@ -353,7 +372,7 @@ async function apiRewrite(text, it, opts, onlyHit) {
 
 const MODES = [
     ['api', '检测到就交给 API 改写', '有命中的段落整段送 API'],
-    ['both', '先规则删，剩下的给 API', '省 token'],
+    ['both', '规则检测后交给 API 局部改写', '保留完整原文'],
     ['rules', '只用规则（不调 API）', '本地，秒出'],
     ['ai', '全部交给 API', '没命中也改'],
 ];
@@ -523,16 +542,23 @@ async function processItem(it, opts) {
     const mode = settings().mode;
     it.error = '';
     it.warn = '';
+    it.after = null;
+    it.left = [];
+    it.rewriteWarnings = [];
     it.status = 'running';
     renderOne(it);
     try {
         let text = it.before;
-        if (mode === 'both' || mode === 'rules') text = cleanText(text, opts).text;
+        if (mode === 'rules') text = cleanText(text, opts).text;
         if (mode !== 'rules') text = await apiRewrite(text, it, opts, mode !== 'ai');
+        const issue = rewriteIssue(it.before, text);
+        if (issue) {
+            throw new Error(`${issue}。请切换 API 局部改写，让模型重新写出承载信息的句子。`);
+        }
         it.after = text;
         it.left = [...new Set(mustHits(text, opts).map((h) => h.match))];
         it.status = text === it.before ? 'same' : 'ready';
-        it.warn = protectStats(it.before, text);
+        it.warn = [...new Set(it.rewriteWarnings), protectStats(it.before, text)].filter(Boolean).join('；');
         if (it.status === 'ready') state.open.add(it.id);
     } catch (e) {
         it.error = String(e?.message || e);
