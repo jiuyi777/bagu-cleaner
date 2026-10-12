@@ -124,16 +124,24 @@ export const LEGACY_AI_PROMPT = `你是中文小说编辑，负责给 AI 角色�
 7. 只输出改写后的正文，不要解释，不要加标题，不要用代码块或引号包住全文。`;
 
 // 所有 API 模式均执行此编辑约束，包括用户保存过的自定义提示词。
-export const EDIT_CONTRACT = `【局部编辑约束】
+export const PREVIOUS_EDIT_CONTRACT = `【局部编辑约束】
 逐段保留原文的人物、动作、对白、场景细节、情绪变化、事件顺序和设定信息，只调整命中的词句及其必要衔接。
 可直接删除不承载信息的赘词、重复修饰；承载信息的词句改成自然表达，保留原意和语气。未命中的内容尽量原样保留。
 必改词是措辞修改目标。遇到宽泛规则或改写后仍命中时，优先保全内容，留下待人工处理的词句。
 逐段输出完整修改稿，正文长度通常保持原文的 90%～110%，至少保留 80%；靠保留细节达到篇幅，保持原有剧情。
 原样保留宏、标签、代码块、链接及 Markdown 结构。只输出修改后的全文。`;
 
-export const DEFAULT_AI_PROMPT = `你是中文小说编辑，负责调整角色卡、世界书和开场白中的套路化表达。
+export const PREVIOUS_AI_PROMPT = `你是中文小说编辑，负责调整角色卡、世界书和开场白中的套路化表达。
 
-${EDIT_CONTRACT}`;
+${PREVIOUS_EDIT_CONTRACT}`;
+
+export const EDIT_CONTRACT = `【局部替换约束】
+根据上下文修改指定片段，保留片段表达的动作、情绪、人物关系、事实和语气。冗余修饰可精简，承载信息的内容换成自然表达。
+未指定的内容由程序原样保留。上下文供理解使用，输出范围仅限指定片段。
+短语可以自然缩短，例如“嘴角勾起一抹若有若无的弧度”可写成“轻轻笑了笑”。长句保留原有事件和细节。
+每个片段按本次请求指定的格式输出替换文字，宏、标签、代码块和链接由程序保护。`;
+
+export const DEFAULT_AI_PROMPT = `你是中文小说编辑，负责调整角色卡、世界书和开场白中的套路化表达。\n\n${EDIT_CONTRACT}`;
 
 export function rewriteIssue(before, after) {
     const count = (s) => String(s ?? '').replace(/<[^>]*>/g, '').replace(/\s/g, '').length;
@@ -225,6 +233,104 @@ const PROTECT_BASE = [
 ];
 const PROTECT_QUOTES = [/“[^“”]*”/g, /「[^「」]*」/g, /『[^『』]*』/g, /"[^"\n]*"/g];
 const PH = /[\uE100-\uF8FF]/g;
+
+/** 返回真实原文范围，保护区与检测、修改共用。 */
+export function protectedRanges(text, quotes = false) {
+    const spans = [];
+    for (const rx of [...PROTECT_BASE, ...(quotes ? PROTECT_QUOTES : [])]) {
+        for (const m of text.matchAll(new RegExp(rx.source, 'g'))) {
+            spans.push({ start: m.index, end: m.index + m[0].length });
+        }
+    }
+    return spans;
+}
+
+export function editTargets(text, { rules = [], protectQuotes = true } = {}, all = false) {
+    const protectedBase = protectedRanges(text);
+    const protectedDialogue = protectQuotes ? protectedRanges(text, true) : protectedBase;
+    const spans = [];
+    const add = (start, end, blocked) => {
+        if (end <= start || blocked.some(p => start < p.end && end > p.start)) return;
+        spans.push({ start, end });
+    };
+    if (all) {
+        // 保留标签/代码所在区间，其他部分逐句形成编辑目标。
+        let start = 0;
+        const append = (from, to) => {
+            const part = text.slice(from, to);
+            for (const m of part.matchAll(/[^。！？!?\n]+[。！？!?]*/g)) {
+                const lead = m[0].match(/^\s*/)[0].length;
+                const value = m[0].trim();
+                if (value) add(from + m.index + lead, from + m.index + lead + value.length, []);
+            }
+        };
+        for (const p of [...protectedBase].sort((a, b) => a.start - b.start)) {
+            if (p.start > start) append(start, p.start);
+            start = Math.max(start, p.end);
+        }
+        append(start, text.length);
+    } else {
+        for (const r of rules) {
+            for (const m of text.matchAll(new RegExp(r.re, 'g'))) {
+                if (m[0]) add(m.index, m.index + m[0].length, r.must ? protectedBase : protectedDialogue);
+            }
+        }
+    }
+    const merged = [];
+    for (const p of spans.sort((a, b) => a.start - b.start || b.end - a.end)) {
+        const last = merged.at(-1);
+        if (last && p.start < last.end) last.end = Math.max(last.end, p.end);
+        else merged.push({ ...p });
+    }
+    return merged.map((p, i) => {
+        const value = text.slice(p.start, p.end);
+        const canDelete = DEFAULT_RULES.some(r => r.type === 'replace' && r.to === ''
+            && ['degree', 'measure', 'modifier'].includes(r.group)
+            && new RegExp(`^(?:${r.re})`).exec(text.slice(p.start))?.[0] === value);
+        return { ...p, id: `s${i + 1}`, text: value, canDelete,
+            context: text.slice(Math.max(0, p.start - 90), Math.min(text.length, p.end + 90)) };
+    });
+}
+
+/** 短语允许自然精简；长片段的明显截断只退回该片段重写。 */
+export function editIssue(target, replacement) {
+    if (typeof replacement !== 'string') return '缺少替换文字';
+    const size = replacement.replace(/\s/g, '').length;
+    const originalSize = target.text.replace(/\s/g, '').length;
+    if (!size && !target.canDelete) return '该片段承载信息，需要换一种表达';
+    if (originalSize >= 60 && size < originalSize * 0.5) return '长片段缺少原有内容，请补全动作和细节';
+    if (size > Math.max(80, originalSize * 4)) return '输出包含片段以外的内容';
+    if (protectedRanges(replacement).length) return '替换文字包含额外的宏、标签或代码';
+    return '';
+}
+
+export function applyEdits(text, targets, replacements) {
+    let result = '';
+    let offset = 0;
+    for (const t of targets) {
+        const next = replacements.get(t.id);
+        result += text.slice(offset, t.start) + (typeof next === 'string' ? next : t.text);
+        offset = t.end;
+    }
+    return result + text.slice(offset);
+}
+
+export function parseEdits(raw) {
+    const text = String(raw ?? '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    const data = JSON.parse(text);
+    const edits = Array.isArray(data) ? data : data?.edits;
+    if (!Array.isArray(edits)) throw new Error('需要 edits 数组');
+    const map = new Map();
+    const duplicates = new Set();
+    for (const e of edits) {
+        if (typeof e?.id !== 'string') continue;
+        if (duplicates.has(e.id)) continue;
+        if (map.has(e.id)) { map.delete(e.id); duplicates.add(e.id); continue; }
+        if (typeof e.text !== 'string') continue;
+        map.set(e.id, e.text);
+    }
+    return map;
+}
 
 function protect(text, quotes) {
     const store = [];
@@ -373,9 +479,11 @@ function flagHits(text, rules, protectQuotes) {
         if (r.type !== 'flag') continue;
         // 必改项连引号里的对白也查
         const src = r.must ? text : p.out;
+        const blocked = r.must ? protectedRanges(text) : [];
         r.rx.lastIndex = 0;
         for (const m of src.matchAll(r.rx)) {
             if (!m[0]) continue;
+            if (blocked.some(p => m.index < p.end && m.index + m[0].length > p.start)) continue;
             const s = r.must ? m[0] : p.restore(m[0]);
             const ctx = r.must ? text.slice(Math.max(0, m.index - 8), m.index + m[0].length + 2) : s;
             hits.push({ id: r.id, label: r.label, type: r.must ? 'must' : 'flag', match: s, context: ctx });

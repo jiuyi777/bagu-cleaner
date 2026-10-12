@@ -1,12 +1,13 @@
 // 八股清理 · SillyTavern 扩展
 import {
     RULE_GROUPS, DEFAULT_RULES, DEFAULT_AI_PROMPT, buildRules, cleanText, scanText,
-    looksLikeInstructions, diffText, protectStats, splitChunks, mustHits, hitList,
-    LEGACY_AI_PROMPT, EDIT_CONTRACT, rewriteIssue,
+    looksLikeInstructions, diffText, protectStats, mustHits,
+    LEGACY_AI_PROMPT, PREVIOUS_AI_PROMPT, EDIT_CONTRACT, rewriteIssue,
+    editTargets, editIssue, applyEdits, parseEdits,
 } from './engine.js';
 
 const MODULE = 'baguCleaner';
-const SETTINGS_VERSION = 3;
+const SETTINGS_VERSION = 4;
 const getCtx = () => SillyTavern.getContext();
 
 const CHAR_FIELDS = [
@@ -60,7 +61,7 @@ function settings() {
     if ((s.version ?? 1) < SETTINGS_VERSION) {
         s.mode = 'api';
         s.includeDisabledEntries = true;
-        if (s.aiPrompt === LEGACY_AI_PROMPT) s.aiPrompt = DEFAULT_AI_PROMPT;
+        if ([LEGACY_AI_PROMPT, PREVIOUS_AI_PROMPT].includes(s.aiPrompt)) s.aiPrompt = DEFAULT_AI_PROMPT;
         s.version = SETTINGS_VERSION;
     }
     for (const f of CHAR_FIELDS) s.fields[f.key] ??= true;
@@ -274,9 +275,10 @@ function listProfiles() {
 
 async function callLLM(system, prompt, srcLen) {
     const c = getCtx();
-    const responseLength = Math.min(8000, Math.max(400, Math.round(srcLen * 1.6) + 200));
     const profile = settings().apiProfile;
     if (profile && c.ConnectionManagerRequestService) {
+        const responseLength = Number(c.chatCompletionSettings?.openai_max_tokens)
+            || Math.max(4096, Math.ceil(srcLen * 1.6) + 200);
         const res = await c.ConnectionManagerRequestService.sendRequest(
             profile,
             [{ role: 'system', content: system }, { role: 'user', content: prompt }],
@@ -285,8 +287,9 @@ async function callLLM(system, prompt, srcLen) {
         return typeof res === 'string' ? res : (res?.content ?? '');
     }
     if (typeof c.generateRaw !== 'function') throw new Error('当前酒馆版本没有 generateRaw');
-    if (c.generateRaw.length === 0) return await c.generateRaw({ prompt, systemPrompt: system, responseLength });
-    return await c.generateRaw(prompt, null, false, false, system, responseLength);
+    // 当前连接沿用酒馆的回复长度，短片段也给推理模型保留原有预算。
+    if (c.generateRaw.length === 0) return await c.generateRaw({ prompt, systemPrompt: system, responseLength: null, trimNames: false });
+    return await c.generateRaw(prompt, null, false, false, system, null, false);
 }
 
 function tidyLLM(s) {
@@ -298,80 +301,74 @@ function tidyLLM(s) {
         .trim();
 }
 
-function buildUserMsg(kind, body, opts) {
-    const hits = hitList(body, opts);
-    const must = [...new Set(mustHits(body, opts).map((h) => h.match))];
-    const seen = new Set();
-    const lines = [];
-    for (const h of hits) {
-        const key = `${h.label}|${h.match}`;
-        if (seen.has(key) || h.type === 'must') continue;
-        seen.add(key);
-        lines.push(`- ${h.label}：「${h.match}」`);
-        if (lines.length >= 40) break;
-    }
-    return `【文本类型】${kind}
-【检测到的八股】
-${lines.join('\n') || '（无）'}
-【必须改掉】${must.length ? must.map((m) => `「${m}」`).join('、') : '（无）'}
-【原文】
-${body}`;
-}
-
-/** 每次都以完整原文为基准；缩短过多的候选不进入结果。 */
-async function rewriteChunk(kind, body, opts) {
-    const sys = `${settings().aiPrompt}\n\n${EDIT_CONTRACT}`;
-    const user = buildUserMsg(kind, body, opts);
-    let best = null;
-    let bestHits = mustHits(body, opts).length;
-    let accepted = false;
-    let problem = '';
-    for (let attempt = 0; attempt < 3; attempt++) {
-        if (state.abort) throw new Error('已停止，本项原文保留');
-        const prompt = attempt === 0 ? user : `${user}
-
-【上次处理问题】${problem}
-请依据上面原段的动作、对白、细节和事件顺序，重新写出完整的一段。保留原意和叙述语气，换掉命中的表达，正文达到原段的 90%～110%，只输出重写后的段落。`;
-        const res = tidyLLM(await callLLM(sys, prompt, body.length));
-        if (state.abort) throw new Error('已停止，本项原文保留');
-        const issue = rewriteIssue(body, res);
-        if (issue) {
-            problem = `${issue}。需要恢复原文的动作、对白和细节，只删赘词，其余改写`;
-            continue;
-        }
-        const hits = mustHits(res, opts);
-        if (!accepted || hits.length <= bestHits) {
-            best = res;
-            bestHits = hits.length;
-            accepted = true;
-        }
-        if (!hits.length) return { text: res, warning: '' };
-        problem = `以下措辞仍需局部改写：${[...new Set(hits.map(h => h.match))].map(m => `「${m}」`).join('、')}。保留它们所表达的信息`;
-    }
-    if (!accepted) throw new Error('该段连续 3 次输出过短，本项生成已停止，可点重新生成再处理。');
-    return { text: best, warning: '部分词句仍待检查，已保留内容完整的修改稿。' };
-}
-
+/** 按编号返回局部替换，正文拼接由插件完成。 */
 async function apiRewrite(text, it, opts, onlyHit) {
-    const out = [];
+    const targets = editTargets(text, opts, !onlyHit);
+    const replacements = new Map();
+    const failed = [];
     it.rewriteWarnings = [];
-    for (const chunk of splitChunks(text, 1)) {
-        const lead = chunk.match(/^\s*/)[0];
-        const trail = chunk.slice(lead.length).match(/\s*$/)[0];
-        const body = chunk.slice(lead.length, chunk.length - trail.length);
-        if (state.abort) throw new Error('已停止，本项原文保留');
-        if (!body || (onlyHit && scanText(body, opts).total === 0)) { out.push(chunk); continue; }
-        const result = await rewriteChunk(it.kind, body, opts);
-        out.push(lead + result.text + trail);
-        if (result.warning) it.rewriteWarnings.push(result.warning);
+    const preference = settings().aiPrompt;
+    const sys = preference.includes(EDIT_CONTRACT) ? preference : `${preference}\n\n${EDIT_CONTRACT}`;
+    const validate = (t, value) => editIssue(t, value)
+        || (value === t.text && scanText(value, opts).total ? '该片段尚未修改' : '')
+        || (mustHits(value, opts).length ? '替换文字仍含必改词，请换成自然表达' : '');
+    processing: for (let i = 0; i < targets.length; i += 8) {
+        if (state.abort) break;
+        const batch = targets.slice(i, i + 8);
+        let edits = new Map();
+        const prompt = `【任务】为${it.kind}修改指定片段。每个 id 对应一段替换文字。
+【格式】仅输出 JSON：{"edits":[{"id":"s1","text":"替换文字"}]}。保持输入编号；text 仅包含对应片段的替换内容。
+【删除】只有 canDelete 为 true 的赘词允许 text 为空，其余片段要改写并保留信息。
+【待修改片段及上下文】
+${JSON.stringify(batch.map(({ id, text, context, canDelete }) => ({ id, text, context, canDelete })))}`;
+        let raw;
+        try { raw = await callLLM(sys, prompt, batch.reduce((n, t) => n + t.text.length + 40, 0)); }
+        catch (e) {
+            if (!replacements.size && !state.abort) throw e;
+            it.rewriteWarnings.push(state.abort ? '已停止，已生成的修改保留。' : `API 中断，已生成的修改保留：${e.message || e}`);
+            break;
+        }
+        if (state.abort) break;
+        try { edits = parseEdits(tidyLLM(raw)); } catch { /* 仅重做缺失或格式错误的片段 */ }
+        const pending = [];
+        for (const target of batch) {
+            const candidate = edits.get(target.id);
+            const issue = validate(target, candidate);
+            if (issue) pending.push({ target, issue });
+            else replacements.set(target.id, candidate);
+        }
+        for (const pendingEdit of pending) {
+            const { target } = pendingEdit;
+            let { issue } = pendingEdit;
+            let candidate;
+            if (state.abort) break processing;
+            const retry = `【文本类型】${it.kind}
+【上下文】${target.context}
+【需要重新写的片段】${target.text}
+【上次问题】${issue}
+用自然的文字重新写这个片段，保留它的含义、动作和语气。只输出该片段的替换文字，其他内容由程序保留。${target.canDelete ? '纯赘词可直接输出空字符串。' : ''}`;
+            try { candidate = tidyLLM(await callLLM(sys, retry, target.text.length)); }
+            catch (e) {
+                if (!replacements.size && !state.abort) throw e;
+                it.rewriteWarnings.push(state.abort ? '已停止，已生成的修改保留。' : `API 中断，已生成的修改保留：${e.message || e}`);
+                break processing;
+            }
+            if (state.abort) break processing;
+            if (target.canDelete && candidate === '""') candidate = '';
+            issue = validate(target, candidate);
+            if (issue) failed.push(target.text.slice(0, 35));
+            else replacements.set(target.id, candidate);
+        }
     }
-    return out.join('');
+    if (state.abort) it.rewriteWarnings.push('已停止，其余片段尚未处理。');
+    if (failed.length) it.rewriteWarnings.push(`${failed.length} 处仍需修改：${failed.join('、')}。其他修改已保留，可在结果框继续编辑。`);
+    return applyEdits(text, targets, replacements);
 }
 
 // ───────────── 弹窗 UI ─────────────
 
 const MODES = [
-    ['api', '检测到就交给 API 改写', '有命中的段落整段送 API'],
+    ['api', '检测到就交给 API 改写', '只替换命中的词句'],
     ['both', '规则检测后交给 API 局部改写', '保留完整原文'],
     ['rules', '只用规则（不调 API）', '本地，秒出'],
     ['ai', '全部交给 API', '没命中也改'],
@@ -434,7 +431,7 @@ async function popupHtml() {
     <div class="menu_button bagu-undo">撤销上次写入</div>
     <div class="menu_button bagu-backup">下载上次备份</div>
   </div>
-  <div class="bagu-status"></div>
+  <div class="bagu-status">v1.2.2 · 只替换命中的词句，其余原文保留。</div>
   <div class="bagu-bulk" style="display:none">
     <a data-sel="all">全选</a> · <a data-sel="none">全不选</a> · <a data-sel="hits">只选有八股的</a> · <a data-sel="changed">只选已生成的</a>
   </div>
@@ -551,7 +548,7 @@ async function processItem(it, opts) {
         let text = it.before;
         if (mode === 'rules') text = cleanText(text, opts).text;
         if (mode !== 'rules') text = await apiRewrite(text, it, opts, mode !== 'ai');
-        const issue = rewriteIssue(it.before, text);
+        const issue = mode === 'rules' ? rewriteIssue(it.before, text) : '';
         if (issue) {
             throw new Error(`${issue}。请切换 API 局部改写，让模型重新写出承载信息的句子。`);
         }
@@ -775,7 +772,7 @@ function settingsHtml() {
 <div class="bagu-settings">
   <div class="inline-drawer">
     <div class="inline-drawer-toggle inline-drawer-header">
-      <b>八股清理</b>
+      <b>八股清理 v1.2.2</b>
       <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
     </div>
     <div class="inline-drawer-content">
