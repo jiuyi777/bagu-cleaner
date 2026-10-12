@@ -1,0 +1,59 @@
+.bagu { text-align: left; display: flex; flex-direction: column; gap: 10px; font-size: 0.95em; }
+.bagu-sec { border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; padding: 8px 10px; }
+.bagu-title { font-weight: bold; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bagu-title .text_pole { flex: 1; min-width: 100px; margin: 0; }
+.bagu-grid { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.bagu-grid label, .bagu-world { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.bagu-worlds { display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; }
+.bagu-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.bagu-actions .menu_button { flex: 1; min-width: 90px; margin: 0; white-space: nowrap; }
+.bagu-small .menu_button { font-size: 0.9em; opacity: 0.85; }
+.bagu-actions .disabled { opacity: 0.4; pointer-events: none; }
+.bagu-status { min-height: 1.2em; }
+.bagu-bulk a, .bagu-item-actions a { cursor: pointer; text-decoration: underline; }
+.bagu-list { display: flex; flex-direction: column; gap: 8px; }
+.bagu-item { border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; padding: 8px 10px; background: var(--black30a); }
+.bagu-head { display: flex; align-items: flex-start; gap: 6px; cursor: pointer; font-weight: bold; word-break: break-all; }
+.bagu-meta { font-size: 0.85em; opacity: 0.8; margin-top: 2px; }
+.bagu-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.bagu-chip { font-size: 0.8em; padding: 1px 6px; border-radius: 10px; }
+.bagu-chip.auto { background: rgba(80, 160, 110, 0.25); }
+.bagu-chip.flag { background: rgba(220, 150, 60, 0.28); }
+.bagu-badge { font-size: 0.8em; padding: 0 6px; border-radius: 4px; margin-left: 4px; border: 1px solid var(--SmartThemeBorderColor); }
+.bagu-badge.ok { border-color: rgba(80, 160, 110, 0.8); }
+.bagu-badge.warn { border-color: rgba(220, 150, 60, 0.9); }
+.bagu-badge.bad { border-color: rgba(210, 70, 70, 0.9); }
+.bagu-diffwrap { margin-top: 6px; }
+.bagu-diffwrap summary { cursor: pointer; }
+.bagu-diff { white-space: pre-wrap; word-break: break-all; line-height: 1.6; margin-top: 6px; max-height: 50vh; overflow-y: auto; padding: 6px; border-radius: 6px; background: var(--black30a); }
+.bagu-del { background: rgba(210, 70, 70, 0.28); text-decoration: line-through; }
+.bagu-add { background: rgba(80, 160, 110, 0.32); }
+.bagu-item-actions { margin-top: 6px; font-size: 0.9em; }
+.bagu-editor { width: 100%; min-height: 160px; margin-top: 6px; }
+.bagu-warn { color: #e0a040; font-size: 0.9em; margin-top: 4px; }
+.bagu-error { color: #e06060; font-size: 0.9em; margin-top: 4px; }
+.bagu-dim { opacity: 0.6; }
+.bagu-settings h4 { margin: 10px 0 4px; }
+.bagu-settings textarea { width: 100%; }
+.bagu-rulelist { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; }
+.bagu-rulelist small { margin-left: auto; }
+.bagu details > summary.bagu-title { cursor: pointer; margin-bottom: 0; }
+.bagu details[open] > summary.bagu-title { margin-bottom: 6px; }
+.bagu-sub { margin: 6px 0 4px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.bagu-sub select { flex: 1; min-width: 140px; margin: 0; }
+.bagu-presets { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
+.bagu-presets a { cursor: pointer; text-decoration: underline; }
+.bagu-presets .text_pole { flex: 1; min-width: 90px; margin: 0; }
+.bagu-opts { margin-top: 6px; }
+.bagu-modes { display: flex; flex-direction: column; gap: 4px; }
+.bagu-modes label { cursor: pointer; }
+.bagu-small-text { font-size: 0.85em; margin-bottom: 4px; }
+.bagu-userwords { width: 100%; }
+.bagu-chip.must { background: rgba(210, 70, 70, 0.35); font-weight: bold; }
+.bagu-mustcount { color: #e06060; }
+.bagu-orig, .bagu-result { margin-top: 6px; }
+.bagu-orig summary, .bagu-result summary { cursor: pointer; }
+.bagu-result > summary { font-weight: bold; }
+.bagu-result .bagu-editor { min-height: 220px; field-sizing: content; max-height: 60vh; line-height: 1.6; }
+.bagu-redo, .bagu-revert { cursor: pointer; }
+.bagu-primary { font-weight: bold; padding: 8px; border-color: var(--SmartThemeQuoteColor); }
