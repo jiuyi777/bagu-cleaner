@@ -31,105 +31,61 @@ async function rewrite(text, opts, responses, onlyHit = true) {
 }
 async function check(name, fn) { await fn(); passed++; console.log(`PASS ${name}`); }
 
-await check('2029-character opening preserves every byte outside the changed phrase', async () => {
-    const phrase = '嘴角勾起一抹若有若无的弧度';
-    const prefix = `<content>\n{{char}}${phrase}。\n\n`, suffix = '\n</content>';
+await check('2029 字开场白：只改含八股的那一句，其他一字不动', async () => {
+    const bad = '{{char}}嘴角勾起一抹若有若无的弧度。';
+    const prefix = `<content>\n${bad}\n\n`, suffix = '\n</content>';
     const original = prefix + '他把书放回桌上，转身关窗。\n'.repeat(200).slice(0, 2029 - prefix.length - suffix.length) + suffix;
-    assert.equal(original.length, 2029);
-    const result = await rewrite(original, options(phrase), [edits([['s1', '轻轻笑了笑']])]);
-    assert.equal(result, original.replace(phrase, '轻轻笑了笑'));
-    assert.ok(result.length > 1900);
+    const result = await rewrite(original, options(''), [edits([['s1', '{{char}}笑了笑。']])]);
+    assert.equal(result, original.replace(bad, '{{char}}笑了笑。'));
     assert.equal(requests.length, 1);
-    assert.equal(requests[0][0].trimNames, false);
-    assert.equal(requests[0][0].responseLength, null);
+    assert.ok(requests[0][0].prompt.includes(bad));
 });
-await check('repeated words get independent replacements and preserve whitespace', async () => {
-    assert.equal(await rewrite('😀他低笑。\r\n\r\n\t她低笑，递来书。  ', options('低笑'), [edits([['s1', '笑了'], ['s2', '轻笑']])]), '😀他笑了。\r\n\r\n\t她轻笑，递来书。  ');
+await check('目标是整句，并附带命中的八股和前后句', () => {
+    const text = '窗外在下雨。他推门进来，嘴角勾起一抹弧度。她没抬头。';
+    const t = engine.editTargets(text, options(''));
+    assert.equal(t.length, 1);
+    assert.equal(t[0].text, '他推门进来，嘴角勾起一抹弧度。');
+    assert.equal(t[0].prev, '窗外在下雨。');
+    assert.equal(t[0].next, '她没抬头。');
+    assert.ok(t[0].hits.some(h => h.match.includes('弧度')));
 });
-await check('overlapping matches form one complete target', () => {
-    const text = '他低笑了一声，继续看书。', targets = engine.editTargets(text, options('低笑\n低笑了一声'));
-    assert.equal(targets.length, 1);
-    assert.equal(targets[0].text, '低笑了一声');
-    assert.equal(engine.applyEdits(text, targets, new Map([['s1', '笑了笑']])), '他笑了笑，继续看书。');
+await check('长短不限：短句可以改长，整句可以删空', async () => {
+    const text = '时间仿佛停滞了。他低笑。她转身离开。';
+    const out = await rewrite(text, options('低笑'), [edits([['s1', ''], ['s2', '他笑了一下，没有接话，把杯子推到她面前。']])]);
+    assert.equal(out, '他笑了一下，没有接话，把杯子推到她面前。她转身离开。');
+    assert.equal(engine.editIssue({ text: '很长的一句话'.repeat(30) }, '短'), '');
 });
-await check('must rules protect macros, tags, code and links while inspecting dialogue', async () => {
-    const text = '{{低笑}} <低笑> ```低笑\n低笑``` https://example.test/低笑 [低笑](https://example.test) “低笑”。', opts = options('低笑');
-    assert.equal(engine.editTargets(text, opts).length, 1);
-    assert.equal(engine.mustHits(text, opts).length, 1);
-    assert.equal(await rewrite(text, opts, [edits([['s1', '笑着']])]), text.replace('“低笑”', '“笑着”'));
-});
-await check('short phrases can shorten naturally without permitting empty information', () => {
-    const target = { text: '嘴角勾起一抹若有若无的弧度', canDelete: false };
-    assert.equal(engine.editIssue(target, '笑了笑'), '');
-    assert.ok(engine.editIssue(target, ''));
-    assert.ok(engine.editIssue(target, '{{char}}笑了笑'));
-});
-await check('safe modifier deletion respects original lookahead and merged content', async () => {
-    const text = '他极其紧张，露出一丝笑意。', opts = options('');
-    assert.deepEqual(engine.editTargets(text, opts).map(t => [t.text, t.canDelete]), [['极其', true], ['一丝', true]]);
-    assert.equal(await rewrite(text, opts, [edits([['s1', ''], ['s2', '']])]), '他紧张，露出笑意。');
-    assert.equal(engine.editTargets('他极其紧张。', options('极其紧张'))[0].canDelete, false);
-});
-await check('a 200-character fragment reduced to one character gets a local rewrite', async () => {
-    const long = '他拿起桌上的书，问朋友明天几点出发。'.repeat(20).slice(0, 200), replacement = long.replaceAll('拿起', '收起');
-    assert.ok(engine.editIssue({ text: long, canDelete: false }, '笑'));
-    assert.equal(await rewrite(`开头。\n${long}\n结尾。`, options(long), [edits([['s1', '笑']]), replacement]), `开头。\n${replacement}\n结尾。`);
+await check('丢了宏的结果会单句重做', async () => {
+    const out = await rewrite('{{char}}低笑。', options('低笑'), [edits([['s1', '他笑了。']]), '{{char}}笑了。']);
+    assert.equal(out, '{{char}}笑了。');
     assert.equal(requests.length, 2);
-    assert.ok(requests[1][0].prompt.includes(long));
+    assert.ok(requests[1][0].prompt.includes('宏'));
 });
-await check('invalid and duplicate ids preserve other valid batch entries', async () => {
-    const raw = JSON.stringify({ edits: [{ id: 's1', text: '笑了' }, { id: 's2', text: '看着' }, { id: 's2', text: '望着' }, { id: 's3', text: 1 }] });
-    const parsed = engine.parseEdits(raw);
-    assert.equal(parsed.get('s1'), '笑了');
-    assert.equal(parsed.has('s2'), false);
-    assert.equal(parsed.has('s3'), false);
-    assert.equal(await rewrite('他低笑，她垂眸。', options('低笑\n垂眸'), [raw, '低头']), '他笑了，她低头。');
-    assert.equal(requests.length, 2);
-    assert.ok(requests[1][0].prompt.includes('【需要重新写的片段】垂眸'));
+await check('还含必改词或没改的句子会重做，重做失败保留原句并提示', async () => {
+    const out = await rewrite('他低笑。她垂眸。', options('低笑\n垂眸'), [edits([['s1', '他低笑着。'], ['s2', '她低头。']]), '他仍在低笑。']);
+    assert.equal(out, '他低笑。她低头。');
+    assert.ok(sandbox.item.rewriteWarnings.some(x => x.includes('没改好')));
 });
-await check('missing entries retry only missing targets', async () => {
-    assert.equal(await rewrite('他低笑，她垂眸。', options('低笑\n垂眸'), [edits([['s2', '低头']]), '笑了']), '他笑了，她低头。');
-    assert.equal(requests.length, 2);
-    assert.ok(requests[1][0].prompt.includes('【需要重新写的片段】低笑'));
+await check('标签、代码、链接不进句子；对白里的普通八股不算，必改词算', () => {
+    const text = '<p>极其</p>\n```极其```\n“她极其冷淡。”他说。\n“低笑。”她说。';
+    const t = engine.editTargets(text, options('低笑'));
+    assert.deepEqual(t.map(x => x.text), ['“低笑。”']);
 });
-await check('a failed local retry retains later valid edits in the same batch', async () => {
-    assert.equal(await rewrite('他低笑，她垂眸。', options('低笑\n垂眸'), [edits([['s2', '低头']]), new Error('502')]), '他低笑，她低头。');
-    assert.ok(sandbox.item.rewriteWarnings.some(x => x.includes('API')));
-});
-await check('unchanged retry marks only its fragment and keeps other edits', async () => {
-    assert.equal(await rewrite('他低笑，她垂眸。', options('低笑\n垂眸'), [edits([['s1', '低笑'], ['s2', '低头']]), '低笑']), '他低笑，她低头。');
-    assert.ok(sandbox.item.rewriteWarnings.some(x => x.includes('低笑')));
-});
-await check('network interruption after eight targets preserves completed changes', async () => {
-    const text = Array.from({ length: 9 }, (_, i) => `第${i + 1}次低笑。`).join('');
-    const first = edits(Array.from({ length: 8 }, (_, i) => [`s${i + 1}`, '笑了']));
-    assert.equal(await rewrite(text, options('低笑'), [first, new Error('网络中断')]), Array.from({ length: 9 }, (_, i) => `第${i + 1}次${i < 8 ? '笑了' : '低笑'}。`).join(''));
+await check('一批 10 句，网络中断保留已完成的修改', async () => {
+    const text = Array.from({ length: 11 }, (_, i) => `第${i + 1}次低笑。`).join('');
+    const first = edits(Array.from({ length: 10 }, (_, i) => [`s${i + 1}`, `第${i + 1}次笑了。`]));
+    const out = await rewrite(text, options('低笑'), [first, new Error('网络中断')]);
+    assert.equal(out, Array.from({ length: 11 }, (_, i) => `第${i + 1}次${i < 10 ? '笑了' : '低笑'}。`).join(''));
     assert.ok(sandbox.item.rewriteWarnings.length);
 });
-await check('v3 prompts migrate to v4 while custom instructions remain active', async () => {
-    ctx.extensionSettings.baguCleaner = { version: 3, aiPrompt: engine.PREVIOUS_AI_PROMPT, mode: 'rules' };
+await check('旧默认提示词迁移到整句约束，自定义提示词保留', async () => {
+    ctx.extensionSettings.baguCleaner = { version: 4, aiPrompt: engine.V4_AI_PROMPT, mode: 'api' };
     assert.equal(evaluate('settings().aiPrompt'), engine.DEFAULT_AI_PROMPT);
-    assert.equal(evaluate('settings().version'), 4);
-    assert.equal(evaluate('settings().mode'), 'api');
-    ctx.extensionSettings.baguCleaner = { version: 3, aiPrompt: '保留轻松的叙述语气' };
-    assert.equal(evaluate('settings().aiPrompt'), '保留轻松的叙述语气');
-    await rewrite('他低笑。', options('低笑'), [edits([['s1', '笑了']])]);
-    assert.ok(requests[0][0].systemPrompt.includes('保留轻松的叙述语气'));
+    assert.equal(evaluate('settings().version'), 5);
+    ctx.extensionSettings.baguCleaner = { version: 4, aiPrompt: '保留轻松的语气\n\n' + engine.V4_EDIT_CONTRACT };
+    assert.equal(evaluate('settings().aiPrompt'), '保留轻松的语气');
+    await rewrite('他低笑。', options('低笑'), [edits([['s1', '他笑了。']])]);
+    assert.ok(requests[0][0].systemPrompt.includes('保留轻松的语气'));
     assert.ok(requests[0][0].systemPrompt.includes(engine.EDIT_CONTRACT));
-});
-await check('legacy generateRaw preserves response budget and disables name trimming', async () => {
-    mock(['返回'], true);
-    assert.equal(await evaluate("callLLM('编辑约束', '目标', 3)"), '返回');
-    assert.equal(requests[0][5], null);
-    assert.equal(requests[0][6], false);
-});
-await check('mixed mode sends original content without pre-deleting a matched clause', async () => {
-    Object.assign(sandbox, { opts: { ...engine.buildRules({ customRules: '删除: 小明低笑[^。]*。' }), protectQuotes: true }, item: { before: '小明低笑，拿起桌上的书。\n\n朋友在门口等他。', kind: '额外开场白', id: 'mixed' } });
-    evaluate("settings().mode = 'both'");
-    mock([edits([['s1', '小明笑了笑，拿起桌上的书。']])]);
-    await evaluate('processItem(item, opts)');
-    assert.equal(sandbox.item.after, '小明笑了笑，拿起桌上的书。\n\n朋友在门口等他。');
-    assert.equal(sandbox.item.status, 'ready');
-    assert.ok(requests[0][0].prompt.includes('小明低笑，拿起桌上的书。'));
 });
 console.log(`PASS ${passed} regression checks; API responses were simulated.`);

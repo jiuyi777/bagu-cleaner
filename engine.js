@@ -135,13 +135,24 @@ export const PREVIOUS_AI_PROMPT = `你是中文小说编辑，负责调整角色
 
 ${PREVIOUS_EDIT_CONTRACT}`;
 
-export const EDIT_CONTRACT = `【局部替换约束】
+// v1.2.2 的片段级约束，只用于识别旧设置并迁移
+export const V4_EDIT_CONTRACT = `【局部替换约束】
 根据上下文修改指定片段，保留片段表达的动作、情绪、人物关系、事实和语气。冗余修饰可精简，承载信息的内容换成自然表达。
 未指定的内容由程序原样保留。上下文供理解使用，输出范围仅限指定片段。
 短语可以自然缩短，例如“嘴角勾起一抹若有若无的弧度”可写成“轻轻笑了笑”。长句保留原有事件和细节。
 每个片段按本次请求指定的格式输出替换文字，宏、标签、代码块和链接由程序保护。`;
 
-export const DEFAULT_AI_PROMPT = `你是中文小说编辑，负责调整角色卡、世界书和开场白中的套路化表达。\n\n${EDIT_CONTRACT}`;
+export const V4_AI_PROMPT = `你是中文小说编辑，负责调整角色卡、世界书和开场白中的套路化表达。\n\n${V4_EDIT_CONTRACT}`;
+
+// 所有 API 模式都附加这段整句修改约束，包括用户自定义的提示词。
+export const EDIT_CONTRACT = `【整句修改约束】
+程序只把含八股的句子交给你，每句给出命中的八股和前后句。其他句子由程序原样保留。
+逐句处理：能删掉的套路词直接删；删了不通顺或丢了内容的，把这句改写成自然的说法。
+保留这句原有的动作、对白内容、事实和语气，不加新情节。长短不限，按改好为准。
+整句只是空套路、删掉不影响内容的，可以输出空字符串。
+句子里的 {{char}}、{{user}} 等宏原样保留。`;
+
+export const DEFAULT_AI_PROMPT = `你是中文小说编辑，负责修改角色卡、世界书和开场白里的 AI 八股句子。\n\n${EDIT_CONTRACT}`;
 
 export function rewriteIssue(before, after) {
     const count = (s) => String(s ?? '').replace(/<[^>]*>/g, '').replace(/\s/g, '').length;
@@ -245,62 +256,85 @@ export function protectedRanges(text, quotes = false) {
     return spans;
 }
 
-export function editTargets(text, { rules = [], protectQuotes = true } = {}, all = false) {
-    const protectedBase = protectedRanges(text);
-    const protectedDialogue = protectQuotes ? protectedRanges(text, true) : protectedBase;
-    const spans = [];
-    const add = (start, end, blocked) => {
-        if (end <= start || blocked.some(p => start < p.end && end > p.start)) return;
-        spans.push({ start, end });
+const MACRO_RX = /\{\{[\s\S]*?\}\}/g;
+const HARD_BASE = PROTECT_BASE.filter((rx) => rx.source !== MACRO_RX.source);
+const SENTENCE_RX = /[^。！？!?…\n]+(?:[。！？!?…]+[”」』"’）)]*)?|[。！？!?…]+[”」』"’）)]*/g;
+
+function rangesOf(text, list) {
+    const out = [];
+    for (const rx of list) {
+        for (const m of text.matchAll(new RegExp(rx.source, 'g'))) out.push({ start: m.index, end: m.index + m[0].length });
+    }
+    return out.sort((a, b) => a.start - b.start);
+}
+const overlaps = (a, b) => a.start < b.end && a.end > b.start;
+
+/** 按句切分。标签、代码块、链接单独隔开，不并进句子；宏留在句子里。 */
+export function splitSentences(text) {
+    const hard = rangesOf(text, HARD_BASE);
+    const out = [];
+    const take = (from, to) => {
+        const part = text.slice(from, to);
+        for (const m of part.matchAll(SENTENCE_RX)) {
+            const lead = m[0].match(/^\s*/)[0].length;
+            const value = m[0].slice(lead).replace(/\s+$/, '');
+            if (!value) continue;
+            const start = from + m.index + lead;
+            out.push({ start, end: start + value.length });
+        }
     };
-    if (all) {
-        // 保留标签/代码所在区间，其他部分逐句形成编辑目标。
-        let start = 0;
-        const append = (from, to) => {
-            const part = text.slice(from, to);
-            for (const m of part.matchAll(/[^。！？!?\n]+[。！？!?]*/g)) {
-                const lead = m[0].match(/^\s*/)[0].length;
-                const value = m[0].trim();
-                if (value) add(from + m.index + lead, from + m.index + lead + value.length, []);
-            }
-        };
-        for (const p of [...protectedBase].sort((a, b) => a.start - b.start)) {
-            if (p.start > start) append(start, p.start);
-            start = Math.max(start, p.end);
-        }
-        append(start, text.length);
-    } else {
-        for (const r of rules) {
-            for (const m of text.matchAll(new RegExp(r.re, 'g'))) {
-                if (m[0]) add(m.index, m.index + m[0].length, r.must ? protectedBase : protectedDialogue);
-            }
-        }
+    let pos = 0;
+    for (const h of hard) {
+        if (h.start > pos) take(pos, h.start);
+        pos = Math.max(pos, h.end);
     }
-    const merged = [];
-    for (const p of spans.sort((a, b) => a.start - b.start || b.end - a.end)) {
-        const last = merged.at(-1);
-        if (last && p.start < last.end) last.end = Math.max(last.end, p.end);
-        else merged.push({ ...p });
-    }
-    return merged.map((p, i) => {
-        const value = text.slice(p.start, p.end);
-        const canDelete = DEFAULT_RULES.some(r => r.type === 'replace' && r.to === ''
-            && ['degree', 'measure', 'modifier'].includes(r.group)
-            && new RegExp(`^(?:${r.re})`).exec(text.slice(p.start))?.[0] === value);
-        return { ...p, id: `s${i + 1}`, text: value, canDelete,
-            context: text.slice(Math.max(0, p.start - 90), Math.min(text.length, p.end + 90)) };
-    });
+    take(pos, text.length);
+    return out;
 }
 
-/** 短语允许自然精简；长片段的明显截断只退回该片段重写。 */
+/**
+ * 编辑目标：含八股的整句。all=true 时每句都是目标。
+ * 每个目标带命中的八股（hits）和前后句，供 API 理解。
+ */
+export function editTargets(text, { rules = [], protectQuotes = true } = {}, all = false) {
+    const sentences = splitSentences(text);
+    const hard = rangesOf(text, PROTECT_BASE);
+    const quotes = protectQuotes ? rangesOf(text, PROTECT_QUOTES) : [];
+    const hitsBy = sentences.map(() => new Map());
+    for (const r of rules) {
+        let rx;
+        try { rx = new RegExp(r.re, 'g'); } catch { continue; }
+        for (const m of text.matchAll(rx)) {
+            if (!m[0]) continue;
+            const span = { start: m.index, end: m.index + m[0].length };
+            if (hard.some((p) => overlaps(span, p))) continue;
+            if (!r.must && quotes.some((p) => overlaps(span, p))) continue;
+            sentences.forEach((s, i) => { if (overlaps(span, s)) hitsBy[i].set(`${r.label}|${m[0]}`, { label: r.label, match: m[0] }); });
+        }
+    }
+    const targets = [];
+    sentences.forEach((s, i) => {
+        if (!all && !hitsBy[i].size) return;
+        const prev = sentences[i - 1];
+        const next = sentences[i + 1];
+        targets.push({
+            ...s,
+            id: `s${targets.length + 1}`,
+            text: text.slice(s.start, s.end),
+            hits: [...hitsBy[i].values()],
+            prev: prev ? text.slice(prev.start, prev.end) : '',
+            next: next ? text.slice(next.start, next.end) : '',
+        });
+    });
+    return targets;
+}
+
+/** 只检查格式：宏不能丢或多，不能凭空出现标签/代码。长短不限，允许删成空。 */
 export function editIssue(target, replacement) {
-    if (typeof replacement !== 'string') return '缺少替换文字';
-    const size = replacement.replace(/\s/g, '').length;
-    const originalSize = target.text.replace(/\s/g, '').length;
-    if (!size && !target.canDelete) return '该片段承载信息，需要换一种表达';
-    if (originalSize >= 60 && size < originalSize * 0.5) return '长片段缺少原有内容，请补全动作和细节';
-    if (size > Math.max(80, originalSize * 4)) return '输出包含片段以外的内容';
-    if (protectedRanges(replacement).length) return '替换文字包含额外的宏、标签或代码';
+    if (typeof replacement !== 'string') return '缺少修改结果';
+    const macros = (s) => (s.match(MACRO_RX) || []).sort().join('');
+    if (macros(target.text) !== macros(replacement)) return '宏（{{char}} 等）要原样保留';
+    if (rangesOf(replacement, HARD_BASE).length) return '结果里多了标签、代码或链接';
     return '';
 }
 

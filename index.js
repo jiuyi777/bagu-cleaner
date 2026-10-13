@@ -2,12 +2,12 @@
 import {
     RULE_GROUPS, DEFAULT_RULES, DEFAULT_AI_PROMPT, buildRules, cleanText, scanText,
     looksLikeInstructions, diffText, protectStats, mustHits,
-    LEGACY_AI_PROMPT, PREVIOUS_AI_PROMPT, EDIT_CONTRACT, rewriteIssue,
+    LEGACY_AI_PROMPT, PREVIOUS_AI_PROMPT, V4_AI_PROMPT, V4_EDIT_CONTRACT, EDIT_CONTRACT, rewriteIssue,
     editTargets, editIssue, applyEdits, parseEdits,
 } from './engine.js';
 
 const MODULE = 'baguCleaner';
-const SETTINGS_VERSION = 4;
+const SETTINGS_VERSION = 5;
 const getCtx = () => SillyTavern.getContext();
 
 const CHAR_FIELDS = [
@@ -61,7 +61,8 @@ function settings() {
     if ((s.version ?? 1) < SETTINGS_VERSION) {
         s.mode = 'api';
         s.includeDisabledEntries = true;
-        if ([LEGACY_AI_PROMPT, PREVIOUS_AI_PROMPT].includes(s.aiPrompt)) s.aiPrompt = DEFAULT_AI_PROMPT;
+        if ([LEGACY_AI_PROMPT, PREVIOUS_AI_PROMPT, V4_AI_PROMPT].includes(s.aiPrompt)) s.aiPrompt = DEFAULT_AI_PROMPT;
+        else s.aiPrompt = String(s.aiPrompt ?? '').replace(V4_EDIT_CONTRACT, '').trim() || DEFAULT_AI_PROMPT;
         s.version = SETTINGS_VERSION;
     }
     for (const f of CHAR_FIELDS) s.fields[f.key] ??= true;
@@ -301,7 +302,7 @@ function tidyLLM(s) {
         .trim();
 }
 
-/** 按编号返回局部替换，正文拼接由插件完成。 */
+/** 只改含八股的整句：按编号返回改后的句子，插件按原位置拼回，其他文字一字不动。 */
 async function apiRewrite(text, it, opts, onlyHit) {
     const targets = editTargets(text, opts, !onlyHit);
     const replacements = new Map();
@@ -310,26 +311,32 @@ async function apiRewrite(text, it, opts, onlyHit) {
     const preference = settings().aiPrompt;
     const sys = preference.includes(EDIT_CONTRACT) ? preference : `${preference}\n\n${EDIT_CONTRACT}`;
     const validate = (t, value) => editIssue(t, value)
-        || (value === t.text && scanText(value, opts).total ? '该片段尚未修改' : '')
-        || (mustHits(value, opts).length ? '替换文字仍含必改词，请换成自然表达' : '');
-    processing: for (let i = 0; i < targets.length; i += 8) {
+        || (value === t.text && t.hits.length ? '这句还没改' : '')
+        || (mustHits(value, opts).length ? `还含必改词：${[...new Set(mustHits(value, opts).map((h) => h.match))].join('、')}` : '');
+    const brief = (t) => ({
+        id: t.id,
+        句子: t.text,
+        八股: t.hits.map((h) => h.match),
+        前一句: t.prev,
+        后一句: t.next,
+    });
+    const apiFail = (e) => {
+        if (!replacements.size && !state.abort) throw e;
+        it.rewriteWarnings.push(state.abort ? '已停止，已生成的修改保留。' : `API 中断，已生成的修改保留：${e.message || e}`);
+    };
+    processing: for (let i = 0; i < targets.length; i += 10) {
         if (state.abort) break;
-        const batch = targets.slice(i, i + 8);
-        let edits = new Map();
-        const prompt = `【任务】为${it.kind}修改指定片段。每个 id 对应一段替换文字。
-【格式】仅输出 JSON：{"edits":[{"id":"s1","text":"替换文字"}]}。保持输入编号；text 仅包含对应片段的替换内容。
-【删除】只有 canDelete 为 true 的赘词允许 text 为空，其余片段要改写并保留信息。
-【待修改片段及上下文】
-${JSON.stringify(batch.map(({ id, text, context, canDelete }) => ({ id, text, context, canDelete })))}`;
+        const batch = targets.slice(i, i + 10);
+        const prompt = `【任务】下面是${it.kind}里含八股的句子，逐句修改。能删的套路词删掉；删了不通顺或丢内容的，整句改写成自然的说法。长短不限。整句只是空套路的，text 填空字符串。
+【格式】只输出 JSON：{"edits":[{"id":"s1","text":"改好的句子"}]}，每个 id 都要有。
+【句子】
+${JSON.stringify(batch.map(brief), null, 1)}`;
         let raw;
         try { raw = await callLLM(sys, prompt, batch.reduce((n, t) => n + t.text.length + 40, 0)); }
-        catch (e) {
-            if (!replacements.size && !state.abort) throw e;
-            it.rewriteWarnings.push(state.abort ? '已停止，已生成的修改保留。' : `API 中断，已生成的修改保留：${e.message || e}`);
-            break;
-        }
+        catch (e) { apiFail(e); break; }
         if (state.abort) break;
-        try { edits = parseEdits(tidyLLM(raw)); } catch { /* 仅重做缺失或格式错误的片段 */ }
+        let edits = new Map();
+        try { edits = parseEdits(tidyLLM(raw)); } catch { /* 格式错了就逐句重做 */ }
         const pending = [];
         for (const target of batch) {
             const candidate = edits.get(target.id);
@@ -337,41 +344,37 @@ ${JSON.stringify(batch.map(({ id, text, context, canDelete }) => ({ id, text, co
             if (issue) pending.push({ target, issue });
             else replacements.set(target.id, candidate);
         }
-        for (const pendingEdit of pending) {
-            const { target } = pendingEdit;
-            let { issue } = pendingEdit;
-            let candidate;
+        for (const { target, issue } of pending) {
             if (state.abort) break processing;
             const retry = `【文本类型】${it.kind}
-【上下文】${target.context}
-【需要重新写的片段】${target.text}
+【前一句】${target.prev || '（无）'}
+【要改的句子】${target.text}
+【后一句】${target.next || '（无）'}
+【这句里的八股】${target.hits.map((h) => h.match).join('、') || '（无）'}
 【上次问题】${issue}
-用自然的文字重新写这个片段，保留它的含义、动作和语气。只输出该片段的替换文字，其他内容由程序保留。${target.canDelete ? '纯赘词可直接输出空字符串。' : ''}`;
+把这句改好：能删的删，删了不通顺就改写，长短不限。只输出改好的这一句；整句是空套路就输出 ""。`;
+            let candidate;
             try { candidate = tidyLLM(await callLLM(sys, retry, target.text.length)); }
-            catch (e) {
-                if (!replacements.size && !state.abort) throw e;
-                it.rewriteWarnings.push(state.abort ? '已停止，已生成的修改保留。' : `API 中断，已生成的修改保留：${e.message || e}`);
-                break processing;
-            }
+            catch (e) { apiFail(e); break processing; }
             if (state.abort) break processing;
-            if (target.canDelete && candidate === '""') candidate = '';
-            issue = validate(target, candidate);
-            if (issue) failed.push(target.text.slice(0, 35));
+            if (candidate === '""' || candidate === '“”') candidate = '';
+            const again = validate(target, candidate);
+            if (again) failed.push(target.text.slice(0, 30));
             else replacements.set(target.id, candidate);
         }
     }
-    if (state.abort) it.rewriteWarnings.push('已停止，其余片段尚未处理。');
-    if (failed.length) it.rewriteWarnings.push(`${failed.length} 处仍需修改：${failed.join('、')}。其他修改已保留，可在结果框继续编辑。`);
+    if (state.abort) it.rewriteWarnings.push('已停止，其余句子没处理。');
+    if (failed.length) it.rewriteWarnings.push(`${failed.length} 句没改好：${failed.join('、')}。可以在结果框里自己改。`);
     return applyEdits(text, targets, replacements);
 }
 
 // ───────────── 弹窗 UI ─────────────
 
 const MODES = [
-    ['api', '检测到就交给 API 改写', '只替换命中的词句'],
-    ['both', '规则检测后交给 API 局部改写', '保留完整原文'],
+    ['api', '检测到就交给 API 改写', '只改含八股的句子'],
+    ['both', '规则检测后交给 API 改句子', '同上'],
     ['rules', '只用规则（不调 API）', '本地，秒出'],
-    ['ai', '全部交给 API', '没命中也改'],
+    ['ai', '每一句都交给 API', '没命中也改'],
 ];
 
 async function popupHtml() {
@@ -550,7 +553,7 @@ async function processItem(it, opts) {
         if (mode !== 'rules') text = await apiRewrite(text, it, opts, mode !== 'ai');
         const issue = mode === 'rules' ? rewriteIssue(it.before, text) : '';
         if (issue) {
-            throw new Error(`${issue}。请切换 API 局部改写，让模型重新写出承载信息的句子。`);
+            throw new Error(`${issue}。请切换成 API 改写，让模型改写这些句子。`);
         }
         it.after = text;
         it.left = [...new Set(mustHits(text, opts).map((h) => h.match))];
